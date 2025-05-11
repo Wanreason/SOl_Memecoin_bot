@@ -1,0 +1,9 @@
+python-telegram-bot==20.0
+solana==0.29.0
+solders==0.14.3
+requests
+apscheduler
+python-dotenv
+base58
+flask
+aiohttp
