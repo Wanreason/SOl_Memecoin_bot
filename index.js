@@ -1,110 +1,90 @@
-import 'dotenv/config';
-import fetch from 'node-fetch';
-import { Telegraf } from 'telegraf';
+const express = require('express');
+const TelegramBot = require('node-telegram-bot-api');
+const fetch = require('node-fetch');
+const dotenv = require('dotenv');
 
-const bot = new Telegraf(process.env.BOT_TOKEN);
+dotenv.config();
 
-// In-memory cache for last checked tokens
-let lastCheckTime = Date.now();
-let lastTokenVolumes = {};
+const app = express();
+const PORT = process.env.PORT || 3000;
+const BOT_TOKEN = process.env.BOT_TOKEN;
+const ALERT_CHANNEL_ID = process.env.ALERT_CHANNEL_ID;
 
-// Welcome message
-bot.start((ctx) => {
-  ctx.reply(`👋 Welcome to Solana Hot Token Alert Bot!
+const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 
-Use:
-/start - Get welcome message
-/hot - 🔥 View trending Solana tokens
-/info [token_address] - ℹ️ Token stats`);
+// In-memory cache to track alerts
+const cache = {};
+
+// Health check route for Render
+app.get('/health', (req, res) => {
+  res.send('Bot is running.');
 });
 
-// Trending tokens command
-bot.command('hot', async (ctx) => {
-  try {
-    const trending = await getTrendingTokens();
-    ctx.reply(trending);
-  } catch (error) {
-    ctx.reply("❌ Error fetching hot tokens.");
-  }
+app.listen(PORT, () => {
+  console.log(`🌐 Server is listening on port ${PORT}`);
 });
 
-// Token info command
-bot.command('info', async (ctx) => {
-  const args = ctx.message.text.split(" ");
-  const address = args[1];
-  if (!address) {
-    ctx.reply("❗ Usage: /info [token_address]");
-    return;
-  }
-  try {
-    const data = await getTokenInfo(address);
-    ctx.reply(data);
-  } catch (error) {
-    ctx.reply("❌ Error fetching token info.");
-  }
+// --- Telegram Command Handlers ---
+bot.onText(/\/start/, (msg) => {
+  bot.sendMessage(msg.chat.id, "🤖 Welcome! I'll keep you updated on trending Solana tokens and send scam alerts.");
 });
 
-// Auto alert interval (every 2 minutes)
+bot.onText(/\/hot/, async (msg) => {
+  const chatId = msg.chat.id;
+  const tokens = await getTrendingTokens();
+  const message = formatTokens(tokens);
+  bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
+});
+
+// --- Auto Alert System ---
 setInterval(async () => {
-  try {
-    const res = await fetch("https://public-api.birdeye.so/public/tokenlist?sort_by=volume_24h&sort_type=desc&limit=10", {
-      headers: { "X-API-KEY": "public" }
-    });
-    const json = await res.json();
-    const tokens = json.data?.tokens || [];
+  const tokens = await getTrendingTokens();
 
-    for (const token of tokens) {
-      const vol = Number(token.volume_24h);
-      const prevVol = lastTokenVolumes[token.address] || 0;
+  for (const token of tokens) {
+    const key = `${token.symbol}_${token.liquidity}_${token.volume}`;
+    if (cache[key]) continue;
+    cache[key] = true;
 
-      // Volume spike detection
-      if (vol > prevVol * 2 && vol > 100000) {
-        bot.telegram.sendMessage(
-          process.env.ALERT_CHANNEL_ID || ctx.chat?.id,
-          `🚀 Volume Spike Detected: ${token.name} (${token.symbol})\n24h Vol: $${formatNumber(vol)}\nLiquidity: $${formatNumber(token.liquidity.usd)}\nhttps://birdeye.so/token/${token.address}`
-        );
-      }
+    // Detect potential scams/rugs
+    const isRug = token.liquidity < 3000 || (token.volume > 50000 && token.liquidity < 1000);
+    const isSpike = token.volume > 100000 && token.volumeChange24h > 100; // hypothetical change check
 
-      // Scam/Rug detection (low LP or huge drop)
-      if (token.liquidity.usd < 3000 || vol > 100000 && token.liquidity.usd < 1000) {
-        bot.telegram.sendMessage(
-          process.env.ALERT_CHANNEL_ID || ctx.chat?.id,
-          `⚠️ Possible Rug Alert: ${token.name} (${token.symbol})\nLiquidity is dangerously low!\nLiquidity: $${formatNumber(token.liquidity.usd)}\nhttps://birdeye.so/token/${token.address}`
-        );
-      }
+    let alertMsg = `📈 *${token.name}* (${token.symbol})\n💧 LP: $${token.liquidity}\n📊 24h Volume: $${token.volume}\n🆔 ${token.tokenAddress}`;
 
-      lastTokenVolumes[token.address] = vol;
+    if (isRug) {
+      alertMsg = '⚠️ *Potential Rug Detected!*\n' + alertMsg;
+    } else if (isSpike) {
+      alertMsg = '🚨 *Volume Spike!*\n' + alertMsg;
+    } else {
+      continue; // skip normal tokens
     }
-  } catch (err) {
-    console.error("Auto alert failed:", err);
+
+    bot.sendMessage(ALERT_CHANNEL_ID || process.env.CHAT_ID, alertMsg, { parse_mode: 'Markdown' });
   }
-}, 2 * 60 * 1000);
+}, 120000); // every 2 minutes
 
-// Trending tokens
+// --- Helper Functions ---
 async function getTrendingTokens() {
-  const res = await fetch("https://public-api.birdeye.so/public/tokenlist?sort_by=volume_24h&sort_type=desc&limit=5", {
-    headers: { "X-API-KEY": "public" }
-  });
-  const json = await res.json();
-  const tokens = json.data?.tokens || [];
-  return tokens.map((t, i) => `${i + 1}. ${t.name} (${t.symbol})\n   💧 LP: $${formatNumber(t.liquidity.usd)} | 📊 24h Vol: $${formatNumber(t.volume_24h)}\n   🔗 https://birdeye.so/token/${t.address}`).join("\n\n");
+  try {
+    const res = await fetch('https://api.dexscreener.com/latest/dex/pairs/solana');
+    const data = await res.json();
+    return data.pairs
+      .filter((pair) => pair.liquidity.usd > 3000 && pair.volume.h24 > 100000)
+      .map((pair) => ({
+        name: pair.baseToken.name,
+        symbol: pair.baseToken.symbol,
+        liquidity: pair.liquidity.usd,
+        volume: pair.volume.h24,
+        tokenAddress: pair.url,
+        volumeChange24h: pair.volumeChange ? pair.volumeChange.h24 || 0 : 0 // fallback
+      }))
+      .slice(0, 10);
+  } catch (err) {
+    console.error('Failed to fetch token data:', err);
+    return [];
+  }
 }
 
-// Token info by address
-async function getTokenInfo(address) {
-  const res = await fetch(`https://public-api.birdeye.so/public/token/${address}`, {
-    headers: { "X-API-KEY": "public" }
-  });
-  const token = await res.json();
-  const t = token.data;
-  if (!t) return "❌ Token not found.";
-  return `🔍 ${t.name} (${t.symbol})\n💧 Liquidity: $${formatNumber(t.liquidity.usd)}\n📊 Volume 24h: $${formatNumber(t.volume_24h)}\n👥 Holders: ${formatNumber(t.holder_count)}\n🔗 https://birdeye.so/token/${address}`;
+function formatTokens(tokens) {
+  return tokens.map((t, i) => `*${i + 1}. ${t.name}* (${t.symbol})\n💧 LP: $${t.liquidity} | 📊 Vol: $${t.volume}\n🔗 [View Token](${t.tokenAddress})`).join('\n\n');
 }
-
-// Format numbers
-function formatNumber(n) {
-  return Number(n).toLocaleString(undefined, { maximumFractionDigits: 1 });
-}
-
-bot.launch();
-console.log("🚀 Bot with real-time alerts and safety checks is running...");
